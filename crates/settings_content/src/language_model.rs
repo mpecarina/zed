@@ -250,9 +250,48 @@ pub enum OpenAiReasoningEffort {
 
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct OpenAiCompatibleCompatibilityContent {
+    pub headers: Option<HashMap<String, String>>,
+    /// Defaults to `true`. Set to `false` to send non-streaming requests
+    /// and synthesize SSE events from the JSON response.
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    /// Top-level JSON field names to remove from the request body before sending.
+    /// Example: `["model", "stream", "prompt_cache_key", "temperature"]`
+    #[serde(default)]
+    pub drop_fields: Vec<String>,
+}
+
+impl Default for OpenAiCompatibleCompatibilityContent {
+    fn default() -> Self {
+        Self {
+            headers: None,
+            stream: true,
+            drop_fields: Vec::new(),
+        }
+    }
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
 pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
+    #[serde(default)]
+    pub compatibility: OpenAiCompatibleCompatibilityContent,
+    #[schemars(skip)]
+    #[serde(skip_serializing)]
+    pub headers: Option<HashMap<String, String>>,
+    /// Defaults to `true`. Set to `false` to send non-streaming requests
+    /// and synthesize SSE events from the JSON response.
+    #[schemars(skip)]
+    #[serde(skip_serializing, default = "default_true")]
+    pub stream: bool,
+    /// Top-level JSON field names to remove from the request body before sending.
+    /// Example: `["model", "stream", "prompt_cache_key", "temperature"]`
+    #[schemars(skip)]
+    #[serde(skip_serializing, default)]
+    pub drop_fields: Vec<String>,
 }
 
 #[with_fallible_options]

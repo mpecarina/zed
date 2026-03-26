@@ -11,9 +11,10 @@ use language_model::{
 };
 use menu;
 use open_ai::{
+    OpenAiCompatibleRequestOptions,
     ResponseStreamEvent,
-    responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
-    stream_completion,
+    responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response_with_options},
+    stream_completion_with_options,
 };
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
@@ -27,10 +28,38 @@ use crate::provider::open_ai::{
 pub use settings::OpenAiCompatibleAvailableModel as AvailableModel;
 pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAiCompatibleProviderOptions {
+    pub headers: std::collections::HashMap<String, String>,
+    pub stream: bool,
+    pub drop_fields: Vec<String>,
+}
+
+impl Default for OpenAiCompatibleProviderOptions {
+    fn default() -> Self {
+        Self {
+            headers: std::collections::HashMap::new(),
+            stream: true,
+            drop_fields: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
+    pub compatibility: OpenAiCompatibleProviderOptions,
+}
+
+impl Default for OpenAiCompatibleSettings {
+    fn default() -> Self {
+        Self {
+            api_url: String::new(),
+            available_models: Vec::new(),
+            compatibility: OpenAiCompatibleProviderOptions::default(),
+        }
+    }
 }
 
 pub struct OpenAiCompatibleLanguageModelProvider {
@@ -214,11 +243,11 @@ impl OpenAiCompatibleLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
+        let (api_key, api_url, compatibility) = self.state.read_with(cx, |state, _cx| {
             (
-                state.api_key_state.key(api_url),
+                state.api_key_state.key(&state.settings.api_url),
                 state.settings.api_url.clone(),
+                state.settings.compatibility.clone(),
             )
         });
 
@@ -227,12 +256,18 @@ impl OpenAiCompatibleLanguageModel {
             let Some(api_key) = api_key else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
-            let request = stream_completion(
+            let opts = OpenAiCompatibleRequestOptions {
+                extra_headers: compatibility.headers,
+                stream: compatibility.stream,
+                drop_fields: compatibility.drop_fields,
+            };
+            let request = stream_completion_with_options(
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
                 &api_key,
                 request,
+                &opts,
             );
             let response = request.await?;
             Ok(response)
@@ -249,11 +284,11 @@ impl OpenAiCompatibleLanguageModel {
     {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
+        let (api_key, api_url, compatibility) = self.state.read_with(cx, |state, _cx| {
             (
-                state.api_key_state.key(api_url),
+                state.api_key_state.key(&state.settings.api_url),
                 state.settings.api_url.clone(),
+                state.settings.compatibility.clone(),
             )
         });
 
@@ -262,12 +297,18 @@ impl OpenAiCompatibleLanguageModel {
             let Some(api_key) = api_key else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
-            let request = stream_response(
+            let opts = OpenAiCompatibleRequestOptions {
+                extra_headers: compatibility.headers,
+                stream: compatibility.stream,
+                drop_fields: compatibility.drop_fields,
+            };
+            let request = stream_response_with_options(
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
                 &api_key,
                 request,
+                &opts,
             );
             let response = request.await?;
             Ok(response)

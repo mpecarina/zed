@@ -8,7 +8,9 @@ use gpui::{
 };
 use language_model::LanguageModelRegistry;
 use language_models::provider::open_ai_compatible::{AvailableModel, ModelCapabilities};
-use settings::{OpenAiCompatibleSettingsContent, update_settings_file};
+use settings::{
+    OpenAiCompatibleCompatibilityContent, OpenAiCompatibleSettingsContent, update_settings_file,
+};
 use ui::{
     Banner, Checkbox, KeyBinding, Modal, ModalFooter, ModalHeader, Section, ToggleState,
     WithScrollbar, prelude::*,
@@ -276,6 +278,14 @@ fn save_provider_to_settings(
                         OpenAiCompatibleSettingsContent {
                             api_url,
                             available_models: models,
+                            compatibility: OpenAiCompatibleCompatibilityContent {
+                                headers: None,
+                                stream: true,
+                                drop_fields: Vec::new(),
+                            },
+                            headers: None,
+                            stream: true,
+                            drop_fields: Vec::new(),
                         },
                     );
             });

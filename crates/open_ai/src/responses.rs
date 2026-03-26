@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
-use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
+use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, http::HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ReasoningEffort, RequestError, Role, ToolChoice};
+use crate::{OpenAiCompatibleRequestOptions, ReasoningEffort, RequestError, Role, ToolChoice};
 
 #[derive(Serialize, Debug)]
 pub struct Request {
@@ -316,18 +316,66 @@ pub async fn stream_response(
     api_key: &str,
     request: Request,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
-    let uri = format!("{api_url}/responses");
-    let request_builder = HttpRequest::builder()
+    stream_response_with_options(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        &OpenAiCompatibleRequestOptions::default(),
+    )
+    .await
+}
+
+/// Extended version of `stream_response` that supports custom headers and field removal.
+pub async fn stream_response_with_options(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    mut request: Request,
+    opts: &OpenAiCompatibleRequestOptions,
+) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    let uri = if let Some((base, query)) = api_url.split_once('?') {
+        format!("{base}/responses?{query}")
+    } else {
+        format!("{api_url}/responses")
+    };
+    let mut request_builder = HttpRequest::builder()
         .method(Method::POST)
-        .uri(uri)
+        .uri(&uri)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()));
 
+    for (key, value) in &opts.extra_headers {
+        if let Ok(header_value) = HeaderValue::from_str(value) {
+            request_builder = request_builder.header(key.as_str(), header_value);
+        }
+    }
+
+    request.stream = opts.stream;
     let is_streaming = request.stream;
+
+    let body = if opts.drop_fields.is_empty() {
+        serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?
+    } else {
+        let mut value =
+            serde_json::to_value(&request).map_err(|e| RequestError::Other(e.into()))?;
+        if let Some(obj) = value.as_object_mut() {
+            for field in &opts.drop_fields {
+                log::info!(
+                    "[{}] Dropping field '{}' from responses request body",
+                    provider_name,
+                    field
+                );
+                obj.remove(field.as_str());
+            }
+        }
+        serde_json::to_string(&value).map_err(|e| RequestError::Other(e.into()))?
+    };
+
     let request = request_builder
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
-        ))
+        .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
     let mut response = client.send(request).await?;

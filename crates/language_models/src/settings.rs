@@ -103,11 +103,30 @@ impl settings::Settings for AllLanguageModelSettings {
             openai_compatible: openai_compatible
                 .into_iter()
                 .map(|(key, value)| {
+                    let compatibility = crate::provider::open_ai_compatible::OpenAiCompatibleProviderOptions {
+                        headers: value
+                            .compatibility
+                            .headers
+                            .or(value.headers)
+                            .map(|h| h.into_iter().collect())
+                            .unwrap_or_default(),
+                        stream: if !value.stream {
+                            false
+                        } else {
+                            value.compatibility.stream
+                        },
+                        drop_fields: if value.compatibility.drop_fields.is_empty() {
+                            value.drop_fields
+                        } else {
+                            value.compatibility.drop_fields
+                        },
+                    };
                     (
                         key,
                         OpenAiCompatibleSettings {
                             api_url: value.api_url,
                             available_models: value.available_models,
+                            compatibility,
                         },
                     )
                 })

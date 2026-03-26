@@ -188,3 +188,93 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+# Cortex / OpenAI-Compatible Provider Patches
+
+This fork carries patches to support enterprise OpenAI-compatible endpoints (e.g. Azure-proxied "Cortex") that lack streaming support and require request body field manipulation. These changes must be rebased forward whenever we pull upstream.
+
+## What the patches do
+
+### Settings schema (`crates/settings_content/src/language_model.rs`)
+
+`OpenAiCompatibleSettingsContent` now exposes a nested **`compatibility`** object as the canonical interface for Cortex-specific behavior:
+- **`compatibility.headers: Option<HashMap<String, String>>`** — arbitrary HTTP headers injected into every request (e.g. `"use-case": "Zed IDE"`).
+- **`compatibility.stream: bool`** — defaults to `true`. Set to `false` to disable SSE streaming and instead receive a single JSON response that gets synthesized into stream events.
+- **`compatibility.drop_fields: Vec<String>`** — top-level JSON field names removed from the request body before sending (e.g. `["model", "stream", "prompt_cache_key", "temperature"]`).
+
+The old flat `headers` / `stream` / `drop_fields` keys are still read as a legacy fallback, but they are no longer the canonical serialized shape.
+
+### Agent UI defaults (`crates/agent_ui/src/agent_configuration/add_llm_provider_modal.rs`)
+
+The add-provider modal must initialize the nested compatibility object when it writes `OpenAiCompatibleSettingsContent`:
+- `compatibility.headers: None`
+- `compatibility.stream: true`
+- `compatibility.drop_fields: Vec::new()`
+
+If this initializer is not updated when the settings struct changes, `agent_ui` fails to compile even though the runtime/provider changes are correct.
+
+### Runtime settings (`crates/language_models/src/provider/open_ai_compatible.rs`)
+
+`OpenAiCompatibleSettings` now carries a nested `compatibility: OpenAiCompatibleProviderOptions` struct. A manual `Default` impl sets `compatibility.stream = true`. The `stream_completion` and `stream_response` methods pass this structured compatibility object into the `_with_options` functions in the `open_ai` crate.
+
+### Settings parsing (`crates/language_models/src/settings.rs`)
+
+The `openai_compatible` map conversion now reads `compatibility` first and then falls back to the legacy flat `headers`, `stream`, and `drop_fields` keys when present.
+
+### Chat completions (`crates/open_ai/src/open_ai.rs`)
+
+**`OpenAiCompatibleRequestOptions`** — structured request options for OpenAI-compatible providers. Carries `extra_headers`, `stream`, and `drop_fields` together so Cortex-specific behavior is explicit in call sites.
+
+**`stream_completion_with_options()`** — extended version of `stream_completion` that accepts an `OpenAiCompatibleRequestOptions` reference. When `opts.stream` is `false`, the full JSON response is read and converted to `Vec<ResponseStreamEvent>` by `synthesize_stream_from_response()`.
+- If `api_url` already contains a query string such as `?api-version=...`, the helper must preserve that query when appending `/chat/completions`.
+
+**`synthesize_stream_from_response()`** — converts a non-streaming chat completion JSON into `ResponseStreamEvent` structs. Handles content, role, reasoning_content, tool_calls, finish_reason, and usage. Filters `"null"` content strings.
+
+### Responses API (`crates/open_ai/src/responses.rs`)
+
+**`stream_response_with_options()`** — extended version of `stream_response` that accepts the same `OpenAiCompatibleRequestOptions` object, applies `extra_headers`, overrides `request.stream`, and removes `drop_fields`. The responses endpoint already handles non-streaming natively once `request.stream` is set, so no separate synthesis is needed.
+- If `api_url` already contains a query string such as `?api-version=...`, the helper must preserve that query when appending `/responses`.
+
+These defaults are intentionally no-op for normal OpenAI-compatible providers. Unless a user explicitly sets `compatibility.headers`, `compatibility.stream: false`, or `compatibility.drop_fields`, existing providers continue using the standard request path.
+
+## Config shape (`settings.json`)
+
+```jsonc
+{
+  "language_models": {
+    "openai_compatible": {
+      "Cortex": {
+        "api_url": "https://cortex.example.com/rest/v2/azure/openai/deployments/model-name?api-version=2024-10-21",
+        "available_models": [
+          {
+            "name": "model-name",
+            "max_tokens": 128000,
+            "capabilities": { "tools": true, "images": true }
+          }
+        ],
+        "compatibility": {
+          "headers": { "use-case": "Zed IDE" },
+          "stream": false,
+          "drop_fields": ["model", "stream", "prompt_cache_key", "temperature"]
+        }
+      }
+    }
+  }
+}
+```
+
+## Rebase checklist
+
+When pulling a new upstream version of Zed:
+
+1. Check `OpenAiCompatibleSettingsContent` in `crates/settings_content/src/language_model.rs` — ensure the nested `compatibility` object still carries `headers`, `stream`, and `drop_fields`, and keep legacy flat keys as read-only fallback only if needed.
+2. Check `OpenAiCompatibleSettings` in `crates/language_models/src/provider/open_ai_compatible.rs` — ensure the runtime struct still carries `compatibility: OpenAiCompatibleProviderOptions` and `Default` sets `compatibility.stream = true`.
+3. Check `crates/language_models/src/settings.rs` — the `openai_compatible` map conversion must read `compatibility` first and only then fall back to legacy flat keys.
+4. Check `OpenAiCompatibleRequestOptions` in `crates/open_ai/src/open_ai.rs` — it is the structured backend interface for Cortex-specific request behavior and should remain the shared parameter object.
+5. Check `stream_completion` signature in `crates/open_ai/src/open_ai.rs` — if it changed, update `stream_completion_with_options` to keep taking `OpenAiCompatibleRequestOptions`. Ensure `synthesize_stream_from_response` still compiles against the `ResponseStreamEvent` / `ChoiceDelta` / `ResponseMessageDelta` types.
+6. Check `stream_response` in `crates/open_ai/src/responses.rs` — if it changed, update `stream_response_with_options` to keep taking `OpenAiCompatibleRequestOptions`.
+7. Ensure both helpers preserve existing `api_url` query params like `api-version` when appending `/chat/completions` or `/responses`.
+8. Check imports in `open_ai_compatible.rs` — must import `OpenAiCompatibleRequestOptions`, `stream_completion_with_options`, and `stream_response_with_options`.
+9. Check `crates/agent_ui/src/agent_configuration/add_llm_provider_modal.rs` — the `OpenAiCompatibleSettingsContent` initializer must set `compatibility.headers: None`, `compatibility.stream: true`, and `compatibility.drop_fields: Vec::new()`.
+10. Run `cargo check -p open_ai -p language_models -p settings_content -p agent_ui` to verify compilation.
+11. Test with a Cortex endpoint: confirm model list loads, chat completion returns, and tool calls work.

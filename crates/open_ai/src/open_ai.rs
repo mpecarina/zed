@@ -334,6 +334,23 @@ pub struct Request {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAiCompatibleRequestOptions {
+    pub extra_headers: std::collections::HashMap<String, String>,
+    pub stream: bool,
+    pub drop_fields: Vec<String>,
+}
+
+impl Default for OpenAiCompatibleRequestOptions {
+    fn default() -> Self {
+        Self {
+            extra_headers: std::collections::HashMap::new(),
+            stream: true,
+            drop_fields: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
@@ -592,52 +609,151 @@ pub async fn stream_completion(
     api_key: &str,
     request: Request,
 ) -> Result<BoxStream<'static, Result<ResponseStreamEvent>>, RequestError> {
-    let uri = format!("{api_url}/chat/completions");
-    let request_builder = HttpRequest::builder()
+    stream_completion_with_options(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        &OpenAiCompatibleRequestOptions::default(),
+    )
+    .await
+}
+
+/// Extended version of `stream_completion` that supports custom headers,
+/// non-streaming mode with SSE synthesis, and field removal from the request body.
+pub async fn stream_completion_with_options(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    mut request: Request,
+    opts: &OpenAiCompatibleRequestOptions,
+) -> Result<BoxStream<'static, Result<ResponseStreamEvent>>, RequestError> {
+    request.stream = opts.stream;
+    let uri = if let Some((base, query)) = api_url.split_once('?') {
+        format!("{base}/chat/completions?{query}")
+    } else {
+        format!("{api_url}/chat/completions")
+    };
+    let mut request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()));
 
+    for (key, value) in &opts.extra_headers {
+        if let Ok(header_value) = HeaderValue::from_str(value) {
+            request_builder = request_builder.header(key.as_str(), header_value);
+        }
+    }
+
+    // Azure-style validators reject object schemas that omit `properties`.
+    for tool in &mut request.tools {
+        match tool {
+            ToolDefinition::Function { function } => {
+                if let Some(params) = function.parameters.as_mut() {
+                    ensure_object_properties(params);
+                }
+            }
+        }
+    }
+
+    let body = if opts.drop_fields.is_empty() {
+        serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?
+    } else {
+        let mut value =
+            serde_json::to_value(&request).map_err(|e| RequestError::Other(e.into()))?;
+        if let Some(obj) = value.as_object_mut() {
+            for field in &opts.drop_fields {
+                log::info!(
+                    "[{}] Dropping field '{}' from request body",
+                    provider_name,
+                    field
+                );
+                obj.remove(field.as_str());
+            }
+        }
+        serde_json::to_string(&value).map_err(|e| RequestError::Other(e.into()))?
+    };
+
+    let provider_name_owned = provider_name.to_owned();
     let request = request_builder
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
-        ))
+        .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
     let mut response = client.send(request).await?;
     if response.status().is_success() {
-        let reader = BufReader::new(response.into_body());
-        Ok(reader
-            .lines()
-            .filter_map(|line| async move {
-                match line {
-                    Ok(line) => {
-                        let line = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str(line) {
-                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
-                                Ok(ResponseStreamResult::Err { error }) => {
-                                    Some(Err(anyhow!(error.message)))
-                                }
-                                Err(error) => {
-                                    log::error!(
-                                        "Failed to parse OpenAI response into ResponseStreamResult: `{}`\n\
-                                        Response: `{}`",
-                                        error,
-                                        line,
-                                    );
-                                    Some(Err(anyhow!(error)))
+        if opts.stream {
+            let reader = BufReader::new(response.into_body());
+            Ok(reader
+                .lines()
+                .filter_map(|line| async move {
+                    match line {
+                        Ok(line) => {
+                            let line = line
+                                .strip_prefix("data: ")
+                                .or_else(|| line.strip_prefix("data:"))?;
+                            if line == "[DONE]" {
+                                None
+                            } else {
+                                match serde_json::from_str(line) {
+                                    Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                                    Ok(ResponseStreamResult::Err { error }) => {
+                                        Some(Err(anyhow!(error.message)))
+                                    }
+                                    Err(error) => {
+                                        log::error!(
+                                            "Failed to parse response: `{}`\nResponse: `{}`",
+                                            error,
+                                            line,
+                                        );
+                                        Some(Err(anyhow!(error)))
+                                    }
                                 }
                             }
                         }
+                        Err(error) => Some(Err(anyhow!(error))),
                     }
-                    Err(error) => Some(Err(anyhow!(error))),
+                })
+                .boxed())
+        } else {
+            let mut body = String::new();
+            log::info!(
+                "[{}] Non-streaming response received (status={}), reading body...",
+                provider_name_owned,
+                response.status()
+            );
+            response
+                .body_mut()
+                .read_to_string(&mut body)
+                .await
+                .map_err(|e| RequestError::Other(e.into()))?;
+
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(value) => {
+                    let events = synthesize_stream_from_response(value);
+                    log::info!(
+                        "[{}] Synthesized {} stream events from non-streaming response",
+                        provider_name_owned,
+                        events.len()
+                    );
+                    Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
                 }
-            })
-            .boxed())
+                Err(error) => {
+                    log::error!(
+                        "[{}] Failed to parse non-streaming response: {}\nBody: {}",
+                        provider_name_owned,
+                        error,
+                        body
+                    );
+                    Err(RequestError::Other(anyhow!(
+                        "Failed to parse non-streaming response: {}",
+                        error
+                    )))
+                }
+            }
+        }
     } else {
         let mut body = String::new();
         response
@@ -652,6 +768,127 @@ pub async fn stream_completion(
             body,
             headers: response.headers().clone(),
         })
+    }
+}
+
+fn synthesize_stream_from_response(value: serde_json::Value) -> Vec<ResponseStreamEvent> {
+    let usage = value
+        .get("usage")
+        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
+    let choices = value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut events = Vec::new();
+    for choice in choices {
+        let index = choice
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .unwrap_or(0) as u32;
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|f| f.as_str())
+            .map(String::from);
+        let message = choice.get("message").cloned().unwrap_or_default();
+
+        let content = message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(String::from);
+        let role = message
+            .get("role")
+            .and_then(|r| serde_json::from_value::<Role>(r.clone()).ok());
+        let reasoning = message
+            .get("reasoning_content")
+            .and_then(|r| r.as_str())
+            .map(String::from);
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .filter_map(|(i, tc)| {
+                        let call = serde_json::from_value::<ToolCall>(tc.clone()).ok()?;
+                        let (name, arguments) = match call.content {
+                            ToolCallContent::Function { function } => {
+                                (Some(function.name), Some(function.arguments))
+                            }
+                        };
+                        Some(ToolCallChunk {
+                            index: i,
+                            id: Some(call.id),
+                            function: Some(FunctionChunk { name, arguments }),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+        events.push(ResponseStreamEvent {
+            choices: vec![ChoiceDelta {
+                index,
+                delta: Some(ResponseMessageDelta {
+                    role,
+                    content,
+                    tool_calls,
+                    reasoning_content: reasoning,
+                }),
+                finish_reason,
+            }],
+            usage: None,
+        });
+    }
+
+    if let Some(usage) = usage {
+        events.push(ResponseStreamEvent {
+            choices: vec![],
+            usage: Some(usage),
+        });
+    }
+
+    events
+}
+
+// Azure/Cortex reject object schemas without an explicit `properties` key.
+fn ensure_object_properties(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        let is_object_type = obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "object");
+        if is_object_type && !obj.contains_key("properties") {
+            obj.insert(
+                "properties".to_string(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+        if let Some(properties) = obj.get_mut("properties") {
+            if let Some(props_obj) = properties.as_object_mut() {
+                for value in props_obj.values_mut() {
+                    ensure_object_properties(value);
+                }
+            }
+        }
+        if let Some(items) = obj.get_mut("items") {
+            ensure_object_properties(items);
+        }
+        if let Some(any_of) = obj.get_mut("anyOf") {
+            if let Some(arr) = any_of.as_array_mut() {
+                for item in arr {
+                    ensure_object_properties(item);
+                }
+            }
+        }
+        if let Some(one_of) = obj.get_mut("oneOf") {
+            if let Some(arr) = one_of.as_array_mut() {
+                for item in arr {
+                    ensure_object_properties(item);
+                }
+            }
+        }
     }
 }
 
